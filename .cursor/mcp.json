@@ -1,0 +1,7 @@
+{
+    "mcpServers": {
+      "altegio-mcp": {
+        "type": "sse",
+        "url": "https://mcp.alteg.io/pro"
+      }
+    }
