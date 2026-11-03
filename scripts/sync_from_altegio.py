@@ -83,25 +83,21 @@ def category_names(client: dict[str, Any]) -> list[str]:
 
 
 def match_campaign(client: dict[str, Any]) -> str | None:
+    """Map only demo marketing clients into campaign cohorts.
+
+    Real CRM clients often have free-text channel tags like 'instagram'.
+    To keep the demo report clean we accept:
+    1) exact demo name prefixes (BBF26 / GM26 / IGM26 / SEO25|SEO26)
+    2) exact full campaign category title
+    """
     name = str(client.get("name") or client.get("display_name") or "")
+    upper = name.upper().strip()
     for prefix, campaign in PREFIX_CAMPAIGN.items():
-        if name.upper().startswith(prefix.upper()):
+        if upper.startswith(prefix.upper() + " ") or upper == prefix.upper():
             return campaign
-    cats = " | ".join(category_names(client)).lower()
+    cats = [c.lower() for c in category_names(client)]
     for campaign in CAMPAIGNS:
         if campaign.lower() in cats:
-            return campaign
-    # soft match by distinctive fragments
-    soft = [
-        ("beauty blogger", CAMPAIGNS[0]),
-        ("googlemaps", CAMPAIGNS[1]),
-        ("google maps", CAMPAIGNS[1]),
-        ("instagram", CAMPAIGNS[2]),
-        ("seo. website", CAMPAIGNS[3]),
-        ("seo website", CAMPAIGNS[3]),
-    ]
-    for fragment, campaign in soft:
-        if fragment in cats or fragment in name.lower():
             return campaign
     return None
 
@@ -111,11 +107,12 @@ def record_attendance(record: dict[str, Any]) -> str:
     visit = record.get("visit_attendance")
     if isinstance(attendance, str):
         return attendance.lower()
+    # Altegio docs: 1=came, 2=confirmed. Classic YClients often used 2=arrived.
     mapping = {
-        1: "waiting",
+        1: "arrived",
         2: "arrived",
         -1: "client_cancelled",
-        0: "no_show",
+        0: "waiting",
     }
     if isinstance(attendance, int):
         return mapping.get(attendance, str(attendance))
@@ -125,20 +122,32 @@ def record_attendance(record: dict[str, Any]) -> str:
 
 
 def record_revenue(record: dict[str, Any]) -> float:
-    for key in ("paid_full", "paid", "cost", "services_cost", "amount"):
+    # Do NOT read paid_full/paid here — those are 0/1 flags, not money.
+    total = 0.0
+    for service in record.get("services") or []:
+        try:
+            total += float(
+                service.get("cost")
+                or service.get("manual_cost")
+                or service.get("first_cost")
+                or service.get("amount_paid")
+                or 0
+            )
+        except (TypeError, ValueError):
+            pass
+    if total > 0:
+        return total
+    for key in ("cost", "services_cost", "amount", "sold_amount", "paid_amount"):
         value = record.get(key)
         if value is None:
             continue
         try:
-            return float(value)
+            num = float(value)
         except (TypeError, ValueError):
             continue
-    total = 0.0
-    for service in record.get("services") or []:
-        try:
-            total += float(service.get("cost") or service.get("amount") or 0)
-        except (TypeError, ValueError):
-            pass
+        # Ignore tiny flag-like values when services list is empty.
+        if num > 1 or key in {"cost", "services_cost", "sold_amount", "paid_amount"}:
+            return num
     return total
 
 

@@ -48,10 +48,14 @@ class AltegioClient:
                     "ALTEGIO_USER_TOKEN is missing. Run: python scripts/auth_user_token.py"
                 )
             auth = f"{auth}, User {self.user_token}"
+        partner_id = get_env("ALTEGIO_PARTNER_ID", "2956") or "2956"
+        # Cloudflare bans the default Python-urllib User-Agent (Error 1010).
         return {
             "Accept": "application/vnd.api.v2+json",
             "Content-Type": "application/json",
             "Authorization": auth,
+            "User-Agent": f"AltegioCohortAnalyzer/1.0 (+partner_id/{partner_id}; local-sync)",
+            "Accept-Language": "en-US,en;q=0.9",
         }
 
     def request(
@@ -165,3 +169,119 @@ class AltegioClient:
     def staff(self) -> list[dict[str, Any]]:
         payload = self.request("GET", f"staff/{self.location_id}")
         return payload.get("data") or []
+
+    def services(self) -> list[dict[str, Any]]:
+        payload = self.request("GET", f"company/{self.location_id}/services")
+        data = payload.get("data") or []
+        # Some deployments nest services under categories.
+        flat: list[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, dict) and item.get("id") and (
+                item.get("price") is not None
+                or item.get("cost") is not None
+                or item.get("title")
+                or item.get("name")
+            ):
+                flat.append(item)
+            for svc in item.get("services") or []:
+                if isinstance(svc, dict) and svc.get("id"):
+                    flat.append(svc)
+        return flat or data
+
+    def create_client(self, *, name: str, phone: str, comment: str = "") -> dict[str, Any]:
+        payload = self.request(
+            "POST",
+            f"clients/{self.location_id}",
+            body={"name": name, "phone": phone, "comment": comment},
+        )
+        data = payload.get("data") or payload
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data
+
+    def create_appointment(
+        self,
+        *,
+        staff_id: int,
+        service_id: int,
+        service_cost: float,
+        client_name: str,
+        client_phone: str,
+        client_id: int | None,
+        datetime_iso: str,
+        seance_length: int = 3600,
+        attendance: int = 1,
+        comment: str = "",
+    ) -> dict[str, Any]:
+        client_body: dict[str, Any] = {"name": client_name, "phone": client_phone}
+        if client_id:
+            client_body["id"] = client_id
+        body = {
+            "staff_id": staff_id,
+            "team_member_id": staff_id,
+            "services": [
+                {
+                    "id": service_id,
+                    "amount": 1,
+                    "cost": service_cost,
+                    "first_cost": service_cost,
+                    "discount": 0,
+                }
+            ],
+            "client": client_body,
+            "datetime": datetime_iso,
+            "seance_length": seance_length,
+            "save_if_busy": True,
+            "send_sms": False,
+            "sms_remain_hours": 0,
+            "email_remain_hours": 0,
+            "attendance": attendance,
+            "comment": comment,
+        }
+        payload = self.request("POST", f"records/{self.location_id}", body=body)
+        data = payload.get("data") or payload
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data
+
+    def set_attendance(self, record_id: int, attendance: int = 1) -> dict[str, Any]:
+        payload = self.request(
+            "PUT",
+            f"record/{self.location_id}/{record_id}",
+            body={"attendance": attendance},
+        )
+        # Fallback dedicated attendance endpoint used by newer docs.
+        if not payload:
+            payload = self.request(
+                "POST",
+                f"locations/{self.location_id}/appointments/{record_id}/attendance",
+                body={"attendance": attendance},
+            )
+        return payload.get("data") or payload
+
+    def create_payment(self, record_id: int, amount: float, document_id: int | None = None) -> dict[str, Any]:
+        """Best-effort payment. Some accounts require a cash account id."""
+        body: dict[str, Any] = {
+            "payment": [
+                {
+                    "amount": amount,
+                    "account_id": int(get_env("ALTEGIO_ACCOUNT_ID", "0") or "0") or None,
+                    "pay_type": "cash",
+                }
+            ]
+        }
+        body["payment"] = [p for p in body["payment"] if p.get("account_id")]
+        if not body["payment"]:
+            # Without a cash account, still try document-based settle if document_id known.
+            if not document_id:
+                return {}
+        try:
+            if document_id:
+                return self.request(
+                    "POST",
+                    f"company/{self.location_id}/sale/{document_id}/payment",
+                    body={"payment": [{"amount": amount}]},
+                )
+        except AltegioError:
+            return {}
+        return {}

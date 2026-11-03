@@ -21,7 +21,8 @@ def load_env(path: Path | None = None) -> dict[str, str]:
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             values[key] = value
-            os.environ.setdefault(key, value)
+            # Always refresh from .env so updated tokens are picked up without process restart.
+            os.environ[key] = value
     return values
 
 
