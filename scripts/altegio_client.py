@@ -115,6 +115,14 @@ class AltegioClient:
         payload = self.request("GET", f"company/{self.location_id}")
         return payload.get("data") or payload
 
+    def locations(self) -> list[dict[str, Any]]:
+        """Locations visible to the authenticated Altegio user."""
+        payload = self.request("GET", "locations")
+        data = payload.get("data") or payload
+        if isinstance(data, dict):
+            data = data.get("items") or data.get("locations") or []
+        return data if isinstance(data, list) else []
+
     def iter_clients(self, page_size: int = 200) -> list[dict[str, Any]]:
         clients: list[dict[str, Any]] = []
         page = 1

@@ -22,28 +22,6 @@ DATA_DIR = ROOT / "data"
 PORTAL_PATH = DATA_DIR / "portal.json"
 SEED_PATH = DATA_DIR / "portal.seed.json"
 
-CAMPAIGNS = [
-    "Paid advertisement. Beauty Blogger XXX. February 2026",
-    "Target. GoogleMaps. January - April 2026",
-    "Target. Instagram. May 2026",
-    "SEO. Website. September - December 2026",
-]
-
-DEFAULT_BUDGETS = {
-    CAMPAIGNS[0]: 1200,
-    CAMPAIGNS[1]: 2400,
-    CAMPAIGNS[2]: 1500,
-    CAMPAIGNS[3]: 2000,
-}
-
-PREFIX_CAMPAIGN = {
-    "BBF26": CAMPAIGNS[0],
-    "GM26": CAMPAIGNS[1],
-    "IGM26": CAMPAIGNS[2],
-    "SEO25": CAMPAIGNS[3],
-    "SEO26": CAMPAIGNS[3],
-}
-
 ARRIVED = {"arrived", "client_came", "success", "completed"}
 
 
@@ -66,7 +44,8 @@ def parse_date(value: Any) -> str | None:
 
 def category_names(client: dict[str, Any]) -> list[str]:
     names: list[str] = []
-    for item in client.get("categories") or []:
+    # In Altegio, client classifications are commonly exposed as card tags.
+    for item in (client.get("tags") or []) + (client.get("categories") or []):
         if isinstance(item, dict):
             title = item.get("title") or item.get("name")
             if title:
@@ -79,27 +58,7 @@ def category_names(client: dict[str, Any]) -> list[str]:
             names.append(value)
         elif isinstance(value, list):
             names.extend(str(x) for x in value if x)
-    return names
-
-
-def match_campaign(client: dict[str, Any]) -> str | None:
-    """Map only demo marketing clients into campaign cohorts.
-
-    Real CRM clients often have free-text channel tags like 'instagram'.
-    To keep the demo report clean we accept:
-    1) exact demo name prefixes (BBF26 / GM26 / IGM26 / SEO25|SEO26)
-    2) exact full campaign category title
-    """
-    name = str(client.get("name") or client.get("display_name") or "")
-    upper = name.upper().strip()
-    for prefix, campaign in PREFIX_CAMPAIGN.items():
-        if upper.startswith(prefix.upper() + " ") or upper == prefix.upper():
-            return campaign
-    cats = [c.lower() for c in category_names(client)]
-    for campaign in CAMPAIGNS:
-        if campaign.lower() in cats:
-            return campaign
-    return None
+    return list(dict.fromkeys(names))
 
 
 def record_attendance(record: dict[str, Any]) -> str:
@@ -160,6 +119,51 @@ def record_services(record: dict[str, Any]) -> list[str]:
     return names
 
 
+def record_is_fully_paid(record: dict[str, Any], sold: float, paid: float = 0) -> bool:
+    status = str(record.get("payment_status") or "").lower()
+    if status in {"unpaid", "partly_paid", "partially_paid"}:
+        return False
+    if record.get("amount_due") is not None and float(record["amount_due"]) > 0.005:
+        return False
+    if status in {"fully_paid", "overpaid"}:
+        return True
+    for key in ("paid_in_full", "paid_full"):
+        if record.get(key) is not None:
+            return record[key] in (True, 1, "1", "true")
+    # The legacy `paid` field is a flag only when boolean or 0/1.
+    flag = record.get("paid")
+    if isinstance(flag, bool) or (isinstance(flag, int) and flag in (0, 1)):
+        return bool(flag)
+    return sold > 0 and paid + 0.005 >= sold
+
+
+def record_payment_history(record: dict[str, Any], sold: float) -> tuple[float, list[dict[str, Any]]]:
+    """Return received amount and payment rows when the API includes them."""
+    raw = record.get("payments") or record.get("payment_history") or record.get("payment") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    rows: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            amount = float(item.get("amount") or item.get("sum") or item.get("paid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        rows.append({
+            "date": parse_date(item.get("date") or item.get("datetime")),
+            "amount": round(amount, 2),
+            "method": item.get("method") or item.get("pay_type") or item.get("account_title") or "",
+        })
+    paid = sum(row["amount"] for row in rows)
+    if not rows and record_is_fully_paid(record, sold):
+        paid = sold
+        rows.append({"date": parse_date(record.get("date") or record.get("datetime")), "amount": round(sold, 2), "method": "paid"})
+    return round(paid, 2), rows
+
+
 def client_id_of(record: dict[str, Any]) -> int | None:
     client = record.get("client")
     if isinstance(client, dict):
@@ -170,7 +174,7 @@ def client_id_of(record: dict[str, Any]) -> int | None:
 
 
 def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
-    lookback = int(get_env("SYNC_LOOKBACK_DAYS", "730") or "730")
+    lookback = int(get_env("SYNC_LOOKBACK_DAYS", "1460") or "1460")
     as_of = date.today()
     start = as_of - timedelta(days=lookback)
     company = client.company()
@@ -184,6 +188,11 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
         cursor = chunk_end + timedelta(days=1)
 
     clients_by_id = {int(c["id"]): c for c in clients_raw if c.get("id") is not None}
+    # Current client tags are authoritative: removed categories must not be
+    # restored from historical appointment comments.
+    def client_categories(cid: int, raw: dict[str, Any]) -> list[str]:
+        return category_names(raw)
+
     visits_by_client: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
         cid = client_id_of(record)
@@ -191,16 +200,20 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
         if cid is None or not visit_date:
             continue
         attendance = record_attendance(record)
-        revenue = record_revenue(record)
-        # Keep arrived/completed visits; also keep paid visits when attendance is ambiguous.
-        paid_full = bool(record.get("paid_full") or record.get("paid"))
-        if attendance not in ARRIVED and not (paid_full and revenue > 0):
+        sold = record_revenue(record)
+        revenue, payments = record_payment_history(record, sold)
+        if attendance not in ARRIVED and not payments:
             continue
         services = record_services(record)
         visits_by_client[cid].append(
             {
                 "date": visit_date,
                 "revenue": round(revenue, 2),
+                "sold": round(sold, 2),
+                "paid": round(revenue, 2),
+                "paid_in_full": record_is_fully_paid(record, sold, revenue),
+                "payments": payments,
+                "appointment_id": record.get("id"),
                 "service": services[0] if services else "Service",
                 "services": services,
                 "attendance": attendance or "arrived",
@@ -208,24 +221,32 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
         )
 
     portal_clients: list[dict[str, Any]] = []
+    category_counts: Counter[str] = Counter()
+    directory: list[dict[str, Any]] = []
+    for cid, raw in clients_by_id.items():
+        cats = client_categories(cid, raw)
+        category_counts.update(cats)
+        directory.append({"id": cid, "name": raw.get("name") or raw.get("display_name") or f"Client {cid}", "categories": cats})
+    for entry in directory:
+        entry["category_count"] = len(entry["categories"])
     for cid, visits in visits_by_client.items():
         raw = clients_by_id.get(cid) or {}
-        campaign = match_campaign(raw)
-        if not campaign:
-            # also try matching from record client payload
-            sample = next((r.get("client") for r in records if client_id_of(r) == cid), None)
-            if isinstance(sample, dict):
-                campaign = match_campaign(sample)
-        if not campaign:
-            continue
+        cats = client_categories(cid, raw)
         visits = sorted(visits, key=lambda v: v["date"])
-        first = visits[0]["date"]
+        arrived_visits = [v for v in visits if v["attendance"] in ARRIVED]
+        first = arrived_visits[0]["date"] if arrived_visits else visits[0]["date"]
         enriched = []
         for visit in visits:
             enriched.append(
                 {
                     "date": visit["date"],
-                    "revenue": visit["revenue"],
+                    "revenue": visit["paid"],
+                    "sold": visit["sold"],
+                    "paid": visit["paid"],
+                    "paid_in_full": visit["paid_in_full"],
+                    "payments": visit["payments"],
+                    "appointment_id": visit["appointment_id"],
+                    "attendance": visit["attendance"],
                     "service": visit["service"],
                     "services": visit.get("services") or [visit["service"]],
                     "age": month_age(first, visit["date"]),
@@ -235,16 +256,27 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
             {
                 "id": cid,
                 "name": raw.get("name") or raw.get("display_name") or f"Client {cid}",
-                "phone": raw.get("phone") or raw.get("phone_code") or "",
-                "campaign": campaign,
+                "phone": str(raw.get("phone") or ""),
+                "campaign": cats[0] if cats else "Без категории",
+                "categories": cats,
                 "first_visit": first,
                 "visits": enriched,
                 "visit_count": len(enriched),
                 "revenue": round(sum(v["revenue"] for v in enriched), 2),
+                "sold": round(sum(v["sold"] for v in enriched), 2),
+                "payment_history": [p for v in enriched for p in v.get("payments", [])],
             }
         )
 
     portal_clients.sort(key=lambda c: (c["campaign"], c["first_visit"], c["name"]))
+    cohort_by_id = {c["id"]: c for c in portal_clients}
+    for entry in directory:
+        cohort = cohort_by_id.get(entry["id"], {})
+        entry["first_visit"] = cohort.get("first_visit")
+        entry["visits"] = cohort.get("visits", [])
+        entry["payment_history"] = cohort.get("payment_history", [])
+        entry["total_spent_in_snapshot"] = cohort.get("sold", 0)
+        entry["paid_in_snapshot"] = cohort.get("revenue", 0)
 
     # RFM over all clients who have visits in the window.
     rfm_groups = {"VIP": 0, "Постоянные": 0, "Спящие": 0, "В зоне риска": 0}
@@ -348,8 +380,10 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
             "name": company.get("title") or company.get("name") or "Casa House",
             "currency": company.get("currency_iso") or company.get("currency") or "EUR",
         },
-        "campaigns": CAMPAIGNS,
-        "default_budgets": DEFAULT_BUDGETS,
+        "campaigns": sorted(category_counts),
+        "categories": [{"title": title, "client_count": count} for title, count in sorted(category_counts.items())],
+        "directory": directory,
+        "default_budgets": {},
         "clients": portal_clients,
         "rfm": {
             "base_size": base_size,
@@ -405,7 +439,15 @@ def load_seed() -> dict[str, Any]:
 
 def save_portal(data: dict[str, Any], path: Path = PORTAL_PATH) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    import os
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False, suffix='.tmp') as tmp:
+        tmp.write(json.dumps(data, ensure_ascii=False, indent=2))
+        temp_path = Path(tmp.name)
+    try:
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
     return path
 
 
@@ -418,10 +460,32 @@ def ensure_seed() -> Path:
 
 
 def sync_now() -> dict[str, Any]:
+    return sync_location(None)
+
+
+def portal_path_for(location_id: int) -> Path:
+    return DATA_DIR / f"portal_{int(location_id)}.json"
+
+
+def sync_location(location_id: int | None) -> dict[str, Any]:
     ensure_seed()
-    api = AltegioClient()
+    selected_id = int(location_id or get_env("ALTEGIO_LOCATION_ID", "764940") or "764940")
+    api = AltegioClient(location_id=selected_id)
     data = build_portal_from_api(api)
-    save_portal(data, PORTAL_PATH)
+    if int(data['location']['id']) != selected_id:
+        raise ValueError('Altegio returned a different location; existing data was preserved')
+    selected_path = portal_path_for(selected_id)
+    if selected_path.exists():
+        previous = json.loads(selected_path.read_text(encoding='utf-8'))
+        data['default_budgets'] = previous.get('default_budgets', {})
+        # Preserve supplemental report metadata absent from the REST response.
+        for key in ('service_catalog', 'services_catalog', 'service_categories'):
+            if key in previous and key not in data:
+                data[key] = previous[key]
+        save_portal(previous, DATA_DIR / 'raw' / f'portal_{selected_id}.previous.json')
+    save_portal(data, selected_path)
+    if selected_id == int(get_env("ALTEGIO_LOCATION_ID", "764940") or "764940"):
+        save_portal(data, PORTAL_PATH)
     return data
 
 

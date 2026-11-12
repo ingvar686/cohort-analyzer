@@ -4,7 +4,16 @@ __pycache__/
 Thumbs.db
 .env
 data/portal.json
+data/portal_*.json
 data/raw/
 !data/portal.seed.json
 .venv/
 venv/
+
+# Local integrations, generated reports and runtime artifacts.
+/.agents/
+/data/*.log
+/data/*.png
+/data/compare_*.json
+/data/upsell_audiences.jsonl
+/dashboards/demo-plan.html
