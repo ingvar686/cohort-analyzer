@@ -16,4 +16,7 @@ venv/
 /data/*.png
 /data/compare_*.json
 /data/upsell_audiences.jsonl
+/data/mailing_campaigns_*.json
+/data/mailing_campaigns_*.tmp
+/data/automation/
 /dashboards/demo-plan.html

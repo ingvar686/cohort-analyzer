@@ -37,6 +37,43 @@ function buildUpsellAudience(clients, catalog, options) {
 }
 let upsellCatalogs = {}, upsellBranch = null, upsellRows = [], upsellGroups = new Map(), upsellSelection = null;
 const upText = (ru,en) => language === 'ru' ? ru : en;
+function upsellCategoryDisplayName(title){
+  const ru={haircuts:'Стрижки',cosmetology:'Косметология',coloring:'Окрашивания',manicure:'Маникюр',pedicure:'Педикюр',massage:'Массаж'};
+  return language==='ru'?(ru[String(title).trim().toLowerCase()]||title):title;
+}
+function buildUpsellCriteria(catalog,options,kind,targetId){
+  const source=catalog.categories.find(c=>String(c.id)===String(options.category));
+  const target=(kind==='service'?catalog.services:catalog.categories).find(s=>String(s.id)===String(targetId));
+  if(!source||!target)return null;
+  const category=kind==='service'?catalog.categories.find(c=>String(c.id)===String(target.category_id)):target;
+  return {version:1,source_category:{id:Number(source.id),title:source.title},
+    source_services:catalog.services.filter(s=>String(s.category_id)===String(source.id)&&options.services.includes(s.title)).map(s=>({id:Number(s.id),title:s.title})),
+    source_minimum_visits:options.minimum,
+    source_all_services:catalog.services.filter(s=>String(s.category_id)===String(source.id)).every(s=>options.services.includes(s.title)),
+    target:{kind,id:Number(target.id),title:target.title,category_id:Number(category?.id),category_title:category?.title||target.title},
+    target_maximum_visits_exclusive:options.maximum,
+    target_category_maximum_visits_exclusive:kind==='service'&&options.mode==='category'?options.maximum:null,
+    as_of:options.asOf||null};
+}
+function upsellVisitLimit(maximum,compact=false){
+  return maximum===1?upText('0 визитов','0 visits'):compact?upText(`<${maximum} визитов`,`<${maximum} visits`):upText(`менее ${maximum} визитов`,`fewer than ${maximum} visits`);
+}
+function upsellCriteriaSummary(criteria){
+  if(!criteria)return upText('Фильтры отбора при создании не были сохранены','Selection filters were not saved when this campaign was created');
+  const source=upsellCategoryDisplayName(criteria.source_category.title),target=criteria.target.kind==='category'?upsellCategoryDisplayName(criteria.target.title):criteria.target.title;
+  const subset=criteria.source_all_services?'':upText(' (выбранные услуги)',' (selected services)');
+  return `${source}${subset}: ${upText('не менее','at least')} ${criteria.source_minimum_visits} ${upText('визитов','visits')} → ${target}: ${upsellVisitLimit(criteria.target_maximum_visits_exclusive)}`;
+}
+function upsellSuggestedName(criteria,maxLength=160,date=new Intl.DateTimeFormat('sv-SE').format(new Date())){
+  if(!criteria)return '';
+  const trim=(text,limit)=>{text=String(text);if(text.length<=limit)return text;let part=text.slice(0,Math.max(0,limit-1));if(/[\uD800-\uDBFF]$/.test(part))part=part.slice(0,-1);return part+'…'};
+  const source=upsellCategoryDisplayName(criteria.source_category.title)+(criteria.source_all_services?'':upText(' (выбор услуг)',' (selected services)'));
+  const target=criteria.target.kind==='category'?upsellCategoryDisplayName(criteria.target.title):criteria.target.title;
+  const prefix=upText('Лояльные: ','Loyal: '),middle=` ≥${criteria.source_minimum_visits} ${upText('визитов','visits')} → `,suffix=` · ${upsellVisitLimit(criteria.target_maximum_visits_exclusive,true)} · ${date}`;
+  const available=maxLength-prefix.length-middle.length-suffix.length;
+  const sourceLimit=Math.min(source.length,Math.max(6,Math.floor(available*.45))),targetLimit=Math.max(6,available-sourceLimit);
+  return prefix+trim(source,Math.max(sourceLimit,available-Math.min(target.length,targetLimit)))+middle+trim(target,targetLimit)+suffix;
+}
 function upsellCatalog() { return DB.service_catalog || upsellCatalogs[DB.location?.id] || {categories:[],services:[]}; }
 function renderUpsellServices() {
   const catalog=upsellCatalog(),category=document.getElementById('upsellCategory').value;
@@ -54,6 +91,7 @@ function renderCross() {
     document.getElementById('upsellTarget').innerHTML='';renderUpsellServices();
   }
   updateUpsellResults();
+  if(typeof renderMailings==='function')renderMailings();
 }
 function updateUpsellResults(){
   const category=document.getElementById('upsellCategory').value;
@@ -81,33 +119,53 @@ document.getElementById('upsellCategory').onchange=()=>{renderUpsellServices();d
 ['upsellMinimum','upsellMaximum'].forEach(id=>document.getElementById(id).oninput=updateUpsellResults);
 ['upsellMode','upsellTarget'].forEach(id=>document.getElementById(id).onchange=updateUpsellResults);
 document.getElementById('upsellLocation').onchange=async e=>{e.target.disabled=true;locationSelect.value=e.target.value;const loaded=await loadRemoteData(e.target.value);if(!loaded)e.target.value=String(DB.location?.id||'');e.target.disabled=false};
-document.getElementById('upsellExport').onclick=()=>{
+function exportUpsellAudience(audience, suffix=''){
   const rows=[upText(['ID клиента','Имя','Телефон','Филиал','Лояльных визитов','Последний визит','Что предложить','Визитов по предложению'],['Client ID','Name','Phone','Location','Loyal visits','Last visit','Opportunity','Opportunity visits'])];
-  upsellRows.forEach(r=>r.opportunities.forEach(o=>rows.push([r.client.id||'',r.client.name,r.client.phone||'',DB.location?.name||'',r.count,r.last,o.title,o.count])));
+  audience.forEach(r=>r.opportunities.forEach(o=>rows.push([r.client.id||'',r.client.name,r.client.phone||'',DB.location?.name||'',r.count,r.last,o.title,o.count])));
   const safe=v=>'"'+String(/^[=+@\-\t\r]/.test(String(v))?"'"+v:v).replaceAll('"','""')+'"';
   const url=URL.createObjectURL(new Blob(['\uFEFF'+rows.map(row=>row.map(safe).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'}));
-  const a=document.createElement('a');a.href=url;a.download=`upsell-${DB.location?.id}-${DB.as_of}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
-};
+  const a=document.createElement('a');a.href=url;a.download=`upsell-${DB.location?.id}-${DB.as_of}${suffix}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+document.getElementById('upsellExport').onclick=()=>exportUpsellAudience(upsellRows);
 
 function renderUpsellGroups(result,options){
   upsellGroups.clear();
+  const clientEdition=document.body.hasAttribute('data-client-edition');
   const serviceResult=buildUpsellAudience(DB.clients||[],upsellCatalog(),{...options,mode:'service',target:''});
-  const saveGroup=(key,title,rows)=>{upsellGroups.set(key,{title,rows});return `<button class="sync" type="button" data-upsell-add="${htmlSafe(key)}" ${rows.some(r=>r.client.id)?'':'disabled'}>${upText('Добавить в категорию клиентов Altegio','Add to an Altegio client category')}</button>`};
+  const groupAction=(key,title,rows)=>{
+    if(clientEdition){
+      upsellGroups.set(key,{title,rows});
+      return `<button class="sync" type="button" data-upsell-export="${htmlSafe(key)}" ${rows.length?'':'disabled'}>${upText('Скачать аудиторию CSV','Download audience CSV')}</button>`;
+    }
+    const [kind,id]=key.split(':');
+    const catalog=upsellCatalog();
+    const service_ids=catalog.services.filter(s=>kind==='service'?String(s.id)===id:String(s.category_id)===id).map(s=>Number(s.id));
+    const criteria=buildUpsellCriteria(catalog,options,kind,id);
+    upsellGroups.set(key,{title,rows,service_ids,criteria});
+    return `<button class="sync" type="button" data-upsell-add="${htmlSafe(key)}" ${rows.some(r=>r.client.id)?'':'disabled'}>${upText('Добавить в категорию клиентов Altegio','Add to an Altegio client category')}</button><button class="theme mailing-new" type="button" data-mailing-new="${htmlSafe(key)}" ${rows.length&&service_ids.length?'':'disabled'}>${upText('Создать рассылку','Create campaign')}</button>`;
+  };
   const table=rows=>`<div class="table-wrap"><table><thead><tr>${upText(['Клиент','Телефон','Визитов по выбранным услугам','Последний визит','Визитов по предложению'],['Client','Phone','Loyal visits','Last visit','Target visits']).map(x=>`<th>${x}</th>`).join('')}</tr></thead><tbody>${rows.map(r=>`<tr><td>${htmlSafe(r.client.name)}</td><td>${htmlSafe(r.client.phone||'—')}</td><td>${r.count}</td><td>${htmlSafe(r.last)}</td><td>${r.targetCount}</td></tr>`).join('')}</tbody></table></div>`;
   document.getElementById('upsellGroups').innerHTML=result.offers.filter(o=>!options.target||o.key===options.target).map(cat=>{
     const rows=result.audience.filter(r=>r.opportunities.some(o=>o.key===cat.key)).map(r=>({...r,targetCount:r.opportunities.find(o=>o.key===cat.key).count}));
     const ids=new Set(rows.map(r=>r.client.id||r.client));
-    const categoryButton=saveGroup('category:'+cat.key,cat.title,rows);
+    const categoryButton=groupAction('category:'+cat.key,cat.title,rows);
     const services=serviceResult.offers.filter(s=>s.category===cat.key).map(service=>{
       const serviceRows=serviceResult.audience.filter(r=>ids.has(r.client.id||r.client)&&r.opportunities.some(o=>o.key===service.key)).map(r=>({...r,targetCount:r.opportunities.find(o=>o.key===service.key).count}));
-      return `<details class="upsell-service"><summary>${htmlSafe(service.title)} <span class="pill">${serviceRows.length} ${upText('клиентов','clients')}</span></summary>${saveGroup('service:'+service.key,service.title,serviceRows)}${table(serviceRows)}</details>`;
+      return `<details class="upsell-service"><summary>${htmlSafe(service.title)} <span class="pill">${serviceRows.length} ${upText('клиентов','clients')}</span></summary>${groupAction('service:'+service.key,service.title,serviceRows)}${table(serviceRows)}</details>`;
     }).join('');
     return `<details class="upsell-group"><summary>${htmlSafe(cat.title)} <span class="pill">${rows.length} ${upText('клиентов','clients')}</span></summary><div class="upsell-group-body">${categoryButton}<details><summary>${upText('Все клиенты категории','All category clients')} · ${rows.length}</summary>${table(rows)}</details>${services}</div></details>`;
   }).join('');
+  document.querySelectorAll('[data-mailing-new]').forEach(b=>b.onclick=()=>openMailingForm(b.dataset.mailingNew));
   document.querySelectorAll('[data-upsell-add]').forEach(b=>b.onclick=()=>openUpsellCategoryForm(b.dataset.upsellAdd));
+  document.querySelectorAll('[data-upsell-export]').forEach(button=>button.onclick=()=>{
+    const key=button.dataset.upsellExport;
+    const group=upsellGroups.get(key);
+    const rows=group.rows.map(row=>({...row,opportunities:[{title:group.title,count:row.targetCount}]}));
+    exportUpsellAudience(rows,'-'+key.replace(':','-'));
+  });
 }
-async function openUpsellCategoryForm(key){
-  const group=upsellGroups.get(key);if(!group)return;
+async function openUpsellCategoryForm(key,override=null){
+  const group=override||upsellGroups.get(key);if(!group)return;
   upsellSelection={...group,location_id:DB.location.id,client_ids:[...new Set(group.rows.map(r=>Number(r.client.id)).filter(id=>Number.isInteger(id)&&id>0))]};
   document.getElementById('upsellNewTagField').hidden=false;const dialog=document.getElementById('upsellAssign');dialog.showModal();
   document.getElementById('upsellAssignDescription').textContent=`${DB.location.name} · ${group.title} · ${upsellSelection.client_ids.length} ${upText('клиентов','clients')}`;
@@ -115,13 +173,15 @@ async function openUpsellCategoryForm(key){
   try{const r=await fetch('/api/client-categories?location_id='+DB.location.id,{cache:'no-store'});const p=await r.json();if(!r.ok||!p.ok)throw Error(p.error||r.status);
     if(!dialog.open||upsellSelection?.location_id!==DB.location.id)return;
     select.innerHTML=`<option value="">${upText('Создать новую категорию','Create a new category')}</option>`+p.items.map(t=>`<option value="${Number(t.id)}">${htmlSafe(t.title)}</option>`).join('');
-    document.getElementById('upsellNewTag').value=`Upsell · ${group.title} · ${new Date().toISOString().slice(0,10)}`;
+    document.getElementById('upsellNewTag').value=group.criteria?upsellSuggestedName(group.criteria,100):group.title.slice(0,100);
     document.getElementById('upsellAssignStatus').textContent='';document.getElementById('upsellAssignSubmit').disabled=false;
   }catch(e){document.getElementById('upsellAssignStatus').textContent=upText('Не удалось загрузить категории: ','Could not load categories: ')+e.message;}
 }
-document.getElementById('upsellAssignClose').onclick=()=>document.getElementById('upsellAssign').close();
-document.getElementById('upsellClientTag').onchange=e=>document.getElementById('upsellNewTagField').hidden=!!e.target.value;
-document.getElementById('upsellAssignForm').onsubmit=async e=>{
+const upsellAssignForm=document.getElementById('upsellAssignForm');
+if(upsellAssignForm){
+ document.getElementById('upsellAssignClose').onclick=()=>document.getElementById('upsellAssign').close();
+ document.getElementById('upsellClientTag').onchange=e=>document.getElementById('upsellNewTagField').hidden=!!e.target.value;
+ upsellAssignForm.onsubmit=async e=>{
   e.preventDefault();const selected=upsellSelection;if(!selected)return;
   const submit=document.getElementById('upsellAssignSubmit'),status=document.getElementById('upsellAssignStatus');submit.disabled=true;
   status.textContent=upText('Добавляем клиентов…','Adding clients…');
@@ -131,4 +191,5 @@ document.getElementById('upsellAssignForm').onsubmit=async e=>{
     if(p.failed.length)status.textContent+=' '+p.failed.map(f=>`${f.client_id}: ${f.error}`).join('; ');
   }catch(err){status.textContent=upText('Не удалось завершить: ','Could not finish: ')+err.message;}
   finally{submit.disabled=false;}
-};
+ };
+}

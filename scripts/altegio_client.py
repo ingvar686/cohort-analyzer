@@ -35,7 +35,7 @@ class AltegioClient:
     ) -> None:
         self.partner_token = partner_token or get_env("ALTEGIO_PARTNER_TOKEN")
         self.user_token = user_token or get_env("ALTEGIO_USER_TOKEN")
-        self.location_id = int(location_id or get_env("ALTEGIO_LOCATION_ID", "764940"))
+        self.location_id = int(location_id or get_env("ALTEGIO_LOCATION_ID", "0") or "0")
         self.api_base = (api_base or get_env("ALTEGIO_API_BASE", "https://api.alteg.io/api/v1")).rstrip("/")
         if not self.partner_token:
             raise AltegioError("ALTEGIO_PARTNER_TOKEN is missing in .env")
@@ -116,12 +116,19 @@ class AltegioClient:
         return payload.get("data") or payload
 
     def locations(self) -> list[dict[str, Any]]:
-        """Locations visible to the authenticated Altegio user."""
-        payload = self.request("GET", "locations")
-        data = payload.get("data") or payload
-        if isinstance(data, dict):
-            data = data.get("items") or data.get("locations") or []
-        return data if isinstance(data, list) else []
+        """Only locations managed by this Business User, never the public directory."""
+        rows = []
+        for page in range(1, 101):
+            payload = self.request("GET", "locations", params={"my": 1, "page": page, "count": 100})
+            chunk = payload.get("data") or []
+            if isinstance(chunk, dict):
+                chunk = chunk.get("items") or chunk.get("locations") or []
+            if not isinstance(chunk, list):
+                raise AltegioError("Unexpected locations response")
+            rows.extend(chunk)
+            if len(chunk) < 100:
+                return rows
+        raise AltegioError("Location list exceeded pagination limit")
 
     def iter_clients(self, page_size: int = 200) -> list[dict[str, Any]]:
         clients: list[dict[str, Any]] = []
@@ -195,6 +202,18 @@ class AltegioClient:
                 if isinstance(svc, dict) and svc.get("id"):
                     flat.append(svc)
         return flat or data
+
+    def service_catalog(self) -> dict[str, Any]:
+        base = self.api_base.rsplit('/api/', 1)[0] + '/api/v2'
+        payload = self.request('GET', f'{base}/locations/{self.location_id}/service_categories')
+        categories = []
+        for row in payload.get('data') or []:
+            attributes = row.get('attributes') or row
+            categories.append({'id': int(row['id']), 'title': attributes.get('title') or str(row['id'])})
+        services = [{'id': int(row['id']), 'title': row.get('title') or str(row['id']),
+                     'category_id': row.get('category_id'), 'active': bool(row.get('active', True))}
+                    for row in self.services() if row.get('id')]
+        return {'categories': categories, 'services': services}
 
     def create_client(self, *, name: str, phone: str, comment: str = "") -> dict[str, Any]:
         payload = self.request(

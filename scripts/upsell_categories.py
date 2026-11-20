@@ -21,6 +21,47 @@ def list_categories(api):
         rows.append({'id': int(item['id']), 'title': attrs.get('title') or str(item['id'])})
     return rows
 
+def add_client_category(api, client_id, category, categories=None):
+    """Add one existing client label without replacing the client's other labels."""
+    cid = int(client_id)
+    category_id = int(category.get('id') or 0)
+    if cid <= 0 or category_id <= 0:
+        raise ValueError('Client and category IDs must be positive')
+    available = categories if categories is not None else list_categories(api)
+    if not any(int(item.get('id') or 0) == category_id for item in available):
+        raise ValueError('Client category not found in this branch')
+
+    def card():
+        data = api.request('GET', f'client/{api.location_id}/{cid}').get('data')
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise RuntimeError('Client card is unavailable')
+        return data
+
+    def tags(raw):
+        values = raw.get('categories', raw.get('labels'))
+        if not isinstance(values, list):
+            raise RuntimeError('Existing client categories are unavailable; update skipped')
+        return {int(item['id'] if isinstance(item, dict) else item) for item in values}
+
+    raw = card()
+    old = tags(raw)
+    if category_id in old:
+        return False
+    if not raw.get('name') or not raw.get('phone') or any(char in str(raw['phone']) for char in '*•'):
+        raise RuntimeError('Full client edit access is required')
+    preserve = ('name','surname','patronymic','phone','email','sex_id','importance_id','discount','card',
+                'birth_date','comment','sms_check','sms_not','online_booking_ban','client_agreements','custom_fields')
+    body = {key: raw[key] for key in preserve if key in raw}
+    body['labels'] = sorted(old | {category_id})
+    response = api.request('PUT', f'client/{api.location_id}/{cid}', body=body, retries=1)
+    if response.get('success') is False:
+        raise RuntimeError('Altegio rejected the update')
+    if not old | {category_id} <= tags(card()):
+        raise RuntimeError('Client category update could not be verified')
+    return True
+
 def assign_category(api, payload):
     ids = list(dict.fromkeys(payload.get('client_ids') or []))
     if not ids or len(ids) > 1000 or any(type(i) is not int or i <= 0 for i in ids):

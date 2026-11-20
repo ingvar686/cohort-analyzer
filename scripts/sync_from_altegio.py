@@ -375,9 +375,10 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
         "as_of": as_of.isoformat(),
         "synced_at": datetime.now().isoformat(timespec="seconds"),
         "source": "altegio_api",
+        "service_catalog": client.service_catalog(),
         "location": {
             "id": int(company.get("id") or client.location_id),
-            "name": company.get("title") or company.get("name") or "Casa House",
+            "name": company.get("title") or company.get("name") or "Altegio",
             "currency": company.get("currency_iso") or company.get("currency") or "EUR",
         },
         "campaigns": sorted(category_counts),
@@ -426,15 +427,10 @@ def build_portal_from_api(client: AltegioClient) -> dict[str, Any]:
 
 
 def load_seed() -> dict[str, Any]:
-    if SEED_PATH.exists():
-        return json.loads(SEED_PATH.read_text(encoding="utf-8"))
-    # Fallback: import static demo from build_reports_portal.
-    from build_reports_portal import portal_data
-
-    data = portal_data([])
-    data["source"] = "seed_demo"
-    data["synced_at"] = None
-    return data
+    """An empty starter dataset. Never bake a salon into a shared report."""
+    return {"as_of": None, "source": "not_connected", "location": {},
+            "clients": [], "directory": [], "categories": [], "campaigns": [],
+            "default_budgets": {}, "service_catalog": {"categories": [], "services": []}}
 
 
 def save_portal(data: dict[str, Any], path: Path = PORTAL_PATH) -> Path:
@@ -452,10 +448,8 @@ def save_portal(data: dict[str, Any], path: Path = PORTAL_PATH) -> Path:
 
 
 def ensure_seed() -> Path:
-    if not SEED_PATH.exists():
-        save_portal(load_seed(), SEED_PATH)
-    if not PORTAL_PATH.exists():
-        save_portal(json.loads(SEED_PATH.read_text(encoding="utf-8")), PORTAL_PATH)
+    # Kept for compatibility with older scripts; startup does not create data.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     return PORTAL_PATH
 
 
@@ -469,14 +463,16 @@ def portal_path_for(location_id: int) -> Path:
 
 def sync_location(location_id: int | None) -> dict[str, Any]:
     ensure_seed()
-    selected_id = int(location_id or get_env("ALTEGIO_LOCATION_ID", "764940") or "764940")
+    from branch_access import connection_id, require_location_access
+    selected_id = require_location_access(location_id or get_env("ALTEGIO_LOCATION_ID"))
     api = AltegioClient(location_id=selected_id)
     data = build_portal_from_api(api)
     if int(data['location']['id']) != selected_id:
         raise ValueError('Altegio returned a different location; existing data was preserved')
+    data['connection_id'] = connection_id()
     selected_path = portal_path_for(selected_id)
-    if selected_path.exists():
-        previous = json.loads(selected_path.read_text(encoding='utf-8'))
+    previous = json.loads(selected_path.read_text(encoding='utf-8')) if selected_path.exists() else {}
+    if previous.get('connection_id') == data['connection_id']:
         data['default_budgets'] = previous.get('default_budgets', {})
         # Preserve supplemental report metadata absent from the REST response.
         for key in ('service_catalog', 'services_catalog', 'service_categories'):
@@ -484,7 +480,7 @@ def sync_location(location_id: int | None) -> dict[str, Any]:
                 data[key] = previous[key]
         save_portal(previous, DATA_DIR / 'raw' / f'portal_{selected_id}.previous.json')
     save_portal(data, selected_path)
-    if selected_id == int(get_env("ALTEGIO_LOCATION_ID", "764940") or "764940"):
+    if selected_id == int(get_env("ALTEGIO_LOCATION_ID", "0") or "0"):
         save_portal(data, PORTAL_PATH)
     return data
 
